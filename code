@@ -1,0 +1,217 @@
+"""
+Stateless CRUD API returning structured JSON.
+
+Run:
+    pip install fastapi uvicorn
+    uvicorn main:app --reload
+
+Docs: http://localhost:8000/docs
+
+Stateless design:
+  - No sessions, cookies, or per-client server memory. Every request carries
+    everything needed to process it.
+  - All persistence goes through the ItemRepository interface. The in-memory
+    implementation below is for demo/tests only; swap in Postgres/Redis/etc.
+    before running more than one instance.
+"""
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Optional, Protocol
+
+from fastapi import FastAPI, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
+# --------------------------------------------------------------------------
+# Schemas
+# --------------------------------------------------------------------------
+class ItemCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    price: float = Field(ge=0)
+    tags: list[str] = Field(default_factory=list)
+
+
+class ItemReplace(ItemCreate):
+    """PUT: full replacement, same fields as create."""
+
+
+class ItemPatch(BaseModel):
+    """PATCH: every field optional; only provided fields are changed."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    price: Optional[float] = Field(default=None, ge=0)
+    tags: Optional[list[str]] = None
+
+
+class Item(ItemCreate):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+# --------------------------------------------------------------------------
+# Storage layer (swap this out for a real database)
+# --------------------------------------------------------------------------
+class ItemRepository(Protocol):
+    def create(self, data: ItemCreate) -> Item: ...
+    def get(self, item_id: str) -> Optional[Item]: ...
+    def list(self, limit: int, offset: int) -> tuple[list[Item], int]: ...
+    def replace(self, item_id: str, data: ItemReplace) -> Optional[Item]: ...
+    def patch(self, item_id: str, data: ItemPatch) -> Optional[Item]: ...
+    def delete(self, item_id: str) -> bool: ...
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class InMemoryItemRepository:
+    def __init__(self) -> None:
+        self._items: dict[str, Item] = {}
+
+    def create(self, data: ItemCreate) -> Item:
+        now = _now()
+        item = Item(id=str(uuid.uuid4()), created_at=now, updated_at=now, **data.model_dump())
+        self._items[item.id] = item
+        return item
+
+    def get(self, item_id: str) -> Optional[Item]:
+        return self._items.get(item_id)
+
+    def list(self, limit: int, offset: int) -> tuple[list[Item], int]:
+        ordered = sorted(self._items.values(), key=lambda i: i.created_at)
+        return ordered[offset : offset + limit], len(ordered)
+
+    def replace(self, item_id: str, data: ItemReplace) -> Optional[Item]:
+        existing = self._items.get(item_id)
+        if not existing:
+            return None
+        updated = Item(
+            id=item_id,
+            created_at=existing.created_at,
+            updated_at=_now(),
+            **data.model_dump(),
+        )
+        self._items[item_id] = updated
+        return updated
+
+    def patch(self, item_id: str, data: ItemPatch) -> Optional[Item]:
+        existing = self._items.get(item_id)
+        if not existing:
+            return None
+        changes = data.model_dump(exclude_unset=True)
+        updated = existing.model_copy(update={**changes, "updated_at": _now()})
+        self._items[item_id] = updated
+        return updated
+
+    def delete(self, item_id: str) -> bool:
+        return self._items.pop(item_id, None) is not None
+
+
+repo: ItemRepository = InMemoryItemRepository()
+
+
+# --------------------------------------------------------------------------
+# Response helpers: consistent envelopes for success and error
+#   success: {"data": ..., "meta": {...}?}
+#   error:   {"error": {"code": str, "message": str, "details": ...?}}
+# --------------------------------------------------------------------------
+def ok(data: Any, status_code: int = 200, meta: Optional[dict] = None) -> JSONResponse:
+    body: dict[str, Any] = {"data": data}
+    if meta is not None:
+        body["meta"] = meta
+    return JSONResponse(status_code=status_code, content=jsonable_encoder(body))
+
+
+def error(status_code: int, code: str, message: str, details: Any = None) -> JSONResponse:
+    err: dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        err["details"] = details
+    return JSONResponse(status_code=status_code, content=jsonable_encoder({"error": err}))
+
+
+def not_found(item_id: str) -> JSONResponse:
+    return error(404, "not_found", f"Item '{item_id}' does not exist.")
+
+
+# --------------------------------------------------------------------------
+# App + error handlers
+# --------------------------------------------------------------------------
+app = FastAPI(title="Items API", version="1.0.0")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(_: Request, exc: RequestValidationError):
+    details = [
+        {"field": ".".join(str(p) for p in e["loc"] if p != "body"), "message": e["msg"]}
+        for e in exc.errors()
+    ]
+    return error(422, "validation_error", "Request validation failed.", details)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_handler(_: Request, exc: StarletteHTTPException):
+    return error(exc.status_code, "http_error", str(exc.detail))
+
+
+@app.exception_handler(Exception)
+async def unhandled_handler(_: Request, exc: Exception):
+    # Log `exc` with your logger of choice; never leak internals to clients.
+    return error(500, "internal_error", "An unexpected error occurred.")
+
+
+# --------------------------------------------------------------------------
+# Endpoints
+# --------------------------------------------------------------------------
+@app.post("/items", status_code=201)
+def create_item(payload: ItemCreate):
+    item = repo.create(payload)
+    response = ok(item, status_code=201)
+    response.headers["Location"] = f"/items/{item.id}"
+    return response
+
+
+@app.get("/items")
+def list_items(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    items, total = repo.list(limit, offset)
+    return ok(items, meta={"total": total, "limit": limit, "offset": offset})
+
+
+@app.get("/items/{item_id}")
+def get_item(item_id: str):
+    item = repo.get(item_id)
+    return ok(item) if item else not_found(item_id)
+
+
+@app.put("/items/{item_id}")
+def replace_item(item_id: str, payload: ItemReplace):
+    item = repo.replace(item_id, payload)
+    return ok(item) if item else not_found(item_id)
+
+
+@app.patch("/items/{item_id}")
+def patch_item(item_id: str, payload: ItemPatch):
+    item = repo.patch(item_id, payload)
+    return ok(item) if item else not_found(item_id)
+
+
+@app.delete("/items/{item_id}")
+def delete_item(item_id: str):
+    if not repo.delete(item_id):
+        return not_found(item_id)
+    return ok({"id": item_id, "deleted": True})
+
+
+@app.get("/health")
+def health():
+    return ok({"status": "ok"})
